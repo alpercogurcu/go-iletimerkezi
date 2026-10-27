@@ -178,7 +178,7 @@ im.EstimateParts("Merhaba şehir")    // SMS parça sayısı TAHMİNİ
 | Metin | Tek | Çok parça |
 |-------|-----|-----------|
 | GSM karakter kümesi | 155 | 153 |
-| GSM dışı Türkçe karakter içeren (ş, ğ, ı, İ, Ş, Ğ, ç) | 150 | 148 |
+| Türkçe harf içeren (ş Ş ğ Ğ ı İ ç Ç ö Ö ü Ü; bazıları GSM'de de olsa güvenli tarafta Türkçe sayılır) | 150 | 148 |
 | Diğer Unicode (emoji vb.) | 65 | 63 |
 
 Genişletme karakterleri (`^ { } \ [ ~ ] | €`) 2 birim sayılır. Paneldeki **"Evrensel Dil Desteği"** ayarı gerçek kodlamayı etkileyebilir; sonuç kesin değildir. `Send`, tahmini 7 parçayı aşan metni istek atmadan `ErrMessageTooLong` ile reddeder; sağlayıcınızın kuralı farklıysa `Config.SkipLengthCheck` ile kapatın.
@@ -190,13 +190,14 @@ Genişletme karakterleri (`^ { } \ [ ~ ] | €`) 2 birim sayılır. Paneldeki **
 - **Panel ayarları:** Panelde "API kullanımına izin ver" açık olmalıdır; sabit IP kısıtı tanımlıysa farklı IP'den gelen istek `401` döner.
 - **Sandbox yok:** Test ortamı bulunmaz; `APITEST` gibi başlıklar yalnızca dokümandaki örneklerdir, gerçek hesapta onaylı başlığınızı kullanın. Canlı testlerde gerçek SMS ve bakiye harcanır.
 - **İYS:** İşlemsel (transactional) SMS'lerde `iys "0"` (`IYSOff`, varsayılan); ticari ileti ise yasal olarak `IYSOn` olmalıdır.
-- **Yönlendirme:** Varsayılan HTTP istemcisi yönlendirmeleri takip etmez; 3xx yanıtı hata sayılır (gönderimde `ErrUncertain`).
+- **Yönlendirme:** Varsayılan HTTP istemcisi yönlendirmeleri takip etmez; 3xx yanıtı istek işlenmedi sayılır ve `ErrHTTP` ile döner (`HTTPStatus` 3xx).
 
 ## Güvenlik notları
 
 - Kütüphane **hiçbir zaman** tam telefon numarası, SMS metni, key veya hash loglamaz. `Logger` yalnızca uç nokta adı, süre, HTTP durum kodu, API durum kodu ve sipariş id'sini alır. Kendi loglarınızda numaraları `MaskNumber` ile maskeleyin.
 - `Config` ve `*Client` yazdırıldığında (`%v`, `%+v`, `%#v`) ve `slog` ile loglandığında anahtarlar gizlenir.
-- `send-sms` isteğinde HTTP/2 transport'unun gövdeyi kendiliğinden yeniden göndermesi engellenir (SMS idempotent değildir); böyle durumlar `ErrUncertain` olarak size döner.
+- HTTP/2'de Go transport'u gövdeyi yalnızca sunucunun işlemediği akışlarda (GOAWAY / REFUSED_STREAM) güvenle yeniden gönderir; bunun dışındaki kopmalar `ErrUncertain` olarak size döner.
+- Yeniden kullanılan bağlantı, istek tamamen yazılmadan sunucu tarafından kapatılırsa (`server closed idle connection`) hata `ErrNotSent` olur; bu tanıma Go'nun hata metnine dayanır, tanınmayan her durum muhafazakâr şekilde `ErrUncertain` kalır.
 - API anahtarlarını kaynak koda veya repoya koymayın; ortam değişkeni/secret yöneticisi kullanın. Panelde sabit IP tanımlarsanız yalnızca o IP'den istek kabul edilir (aksi halde `401`).
 - Hata değerleri istek gövdesini (kimlik bilgisi, numara) içermez.
 
