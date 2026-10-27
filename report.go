@@ -29,24 +29,45 @@ const (
 
 // ReportMessage, rapordaki tek alıcı satırıdır.
 type ReportMessage struct {
+	// Number, sunucunun döndürdüğü biçimdedir (örn. "+905xxxxxxxxx").
 	Number string
 	Status MessageStatus
 }
 
+// NormalizedNumber, Number'ı NormalizeTR ile "5xxxxxxxxx" biçimine çevirir (eşleştirme için).
+func (m ReportMessage) NormalizedNumber() (string, error) { return NormalizeTR(m.Number) }
+
 // Report, GetReport'un bir sayfalık sonucudur.
 type Report struct {
-	OrderID  string
-	Status   OrderStatus
+	OrderID string
+	Status  OrderStatus
+	// Sunucu sayaçları (tüm sipariş için; HasTotals false ise yanıtta yoktu).
+	HasTotals   bool
+	Total       int
+	Delivered   int
+	Undelivered int
+	Waiting     int
+	// SubmitAt ve SendAt Europe/Istanbul saatindedir; çözümlenemezse sıfır değerdir.
+	SubmitAt time.Time
+	SendAt   time.Time
+	Sender   string
+	// Price, siparişin ücretidir (birimi sağlayıcıya bağlıdır; yanıtta yoksa 0).
+	Price float64
+	// Messages, bu sayfadaki alıcı satırlarıdır.
 	Messages []ReportMessage
 }
 
-// ReportCounts, bir rapor sayfasındaki mesaj durumlarının sayımıdır.
+// ReportCounts, mesaj durumu sayımıdır.
 type ReportCounts struct {
 	Total, Sent, Failed, Pending int
 }
 
-// Counts, bu sayfadaki mesajları duruma göre sayar (sayfalama varsa yalnızca bu sayfayı kapsar).
+// Counts, sayımı döner. Yanıtta sunucu sayaçları varsa onları (tüm sipariş; Sent=delivered,
+// Failed=undelivered, Pending=waiting) tercih eder; yoksa yalnızca bu sayfadaki mesajları sayar.
 func (r *Report) Counts() ReportCounts {
+	if r.HasTotals {
+		return ReportCounts{Total: r.Total, Sent: r.Delivered, Failed: r.Undelivered, Pending: r.Waiting}
+	}
 	var c ReportCounts
 	for _, m := range r.Messages {
 		c.Total++
@@ -60,6 +81,14 @@ func (r *Report) Counts() ReportCounts {
 		}
 	}
 	return c
+}
+
+func parseIstanbul(s string) time.Time {
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", strings.TrimSpace(s), istanbul)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 func atoiFlex(f flexString) int {
@@ -102,20 +131,36 @@ func (c *Client) GetReport(ctx context.Context, orderID string, page, rowCount i
 		return nil, err
 	}
 	var o struct {
-		ID      flexString `json:"id"`
-		Status  flexString `json:"status"`
-		Message oneOrMany[struct {
+		ID          flexString  `json:"id"`
+		Status      flexString  `json:"status"`
+		Total       *flexString `json:"total"`
+		Delivered   flexString  `json:"delivered"`
+		Undelivered flexString  `json:"undelivered"`
+		Waiting     flexString  `json:"waiting"`
+		SubmitAt    string      `json:"submitAt"`
+		SendAt      string      `json:"sendAt"`
+		Sender      string      `json:"sender"`
+		Price       flexString  `json:"price"`
+		Message     oneOrMany[struct {
 			Number flexString `json:"number"`
 			Status flexString `json:"status"`
 		}] `json:"message"`
 	}
-	if len(env.Response.Order) == 0 {
-		return nil, fmt.Errorf("%w: yanıtta order yok", ErrUncertain)
+	if raw := strings.TrimSpace(string(env.Response.Order)); raw == "" || raw == "null" {
+		return nil, fmt.Errorf("%w: yanıtta order yok", ErrUnexpectedResponse)
 	}
 	if err := json.Unmarshal(env.Response.Order, &o); err != nil {
-		return nil, fmt.Errorf("iletimerkezi: rapor çözümlenemedi: %w", err)
+		return nil, fmt.Errorf("%w: rapor çözümlenemedi: %w", ErrUnexpectedResponse, err)
 	}
-	rep := &Report{OrderID: string(o.ID), Status: OrderStatus(atoiFlex(o.Status))}
+	rep := &Report{
+		OrderID: string(o.ID), Status: OrderStatus(atoiFlex(o.Status)),
+		Delivered: atoiFlex(o.Delivered), Undelivered: atoiFlex(o.Undelivered), Waiting: atoiFlex(o.Waiting),
+		SubmitAt: parseIstanbul(o.SubmitAt), SendAt: parseIstanbul(o.SendAt), Sender: o.Sender,
+	}
+	if o.Total != nil {
+		rep.HasTotals, rep.Total = true, atoiFlex(*o.Total)
+	}
+	rep.Price, _ = strconv.ParseFloat(strings.ReplaceAll(string(o.Price), ",", "."), 64)
 	if rep.OrderID == "" {
 		rep.OrderID = orderID
 	}
@@ -124,6 +169,9 @@ func (c *Client) GetReport(ctx context.Context, orderID string, page, rowCount i
 	}
 	return rep, nil
 }
+
+// MaxSummaryDays, Summaries için izin verilen en uzun tarih aralığıdır (gün).
+const MaxSummaryDays = 10
 
 // OrderSummary, Summaries'in döndürdüğü sipariş özetidir.
 type OrderSummary struct {
@@ -140,6 +188,8 @@ type OrderSummary struct {
 
 // Summaries, [start, end] tarih aralığındaki siparişlerin özetini döner (get-reports).
 // Tarihler Europe/Istanbul gününe göre "YYYY-AA-GG" biçiminde gönderilir. page 0 ise 1.
+// Tarih aralığı 10 günden uzun olamaz (sunucu 458 döner); kütüphane bunu istek atmadan
+// ErrInvalidDate ile reddeder. page hem filter içinde hem istek kökünde gönderilir.
 // toplam, aralıktaki toplam sipariş sayısıdır.
 func (c *Client) Summaries(ctx context.Context, start, end time.Time, page int) (orders []OrderSummary, toplam int, err error) {
 	if page < 0 || end.Before(start) {
@@ -148,12 +198,17 @@ func (c *Client) Summaries(ctx context.Context, start, end time.Time, page int) 
 	if page == 0 {
 		page = 1
 	}
+	sd, ed := start.In(istanbul), end.In(istanbul)
+	days := int(time.Date(ed.Year(), ed.Month(), ed.Day(), 0, 0, 0, 0, time.UTC).Sub(time.Date(sd.Year(), sd.Month(), sd.Day(), 0, 0, 0, 0, time.UTC)).Hours() / 24)
+	if days > MaxSummaryDays {
+		return nil, 0, fmt.Errorf("%w: tarih aralığı %d günden uzun olamaz", ErrInvalidDate, MaxSummaryDays)
+	}
 	filter := map[string]any{
 		"start": start.In(istanbul).Format("2006-01-02"),
 		"end":   end.In(istanbul).Format("2006-01-02"),
 		"page":  page,
 	}
-	env, err := c.call(ctx, "get-reports", map[string]any{"authentication": c.auth(), "filter": filter})
+	env, err := c.call(ctx, "get-reports", map[string]any{"authentication": c.auth(), "filter": filter, "page": page})
 	if err != nil {
 		return nil, 0, err
 	}
