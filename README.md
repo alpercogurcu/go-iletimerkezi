@@ -90,13 +90,16 @@ res, err := client.Send(ctx, im.SendRequest{
 })
 ```
 
-Alıcılar `NormalizeTR` ile normalleştirilir ve metin başına tekilleştirilir. `IYS` boşsa `IYSOff` kabul edilir.
+Alıcılar `NormalizeTR` ile normalleştirilir ve metin başına tekilleştirilir. `IYS` boşsa `IYSOff` kabul edilir (işlemsel/bilgilendirme SMS'leri için `iys: "0"`).
+
+> **Not:** Planlı gönderim (`SendAt`) canlıda henüz doğrulanmadı. Anlık gönderimde `sendDateTime` boş dizi (`[]`, canlıda doğrulandı), planlı gönderimde tek string (`"GG/AA/YYYY SS:DD"`, resmi SDK ve dokümana göre) gönderilir.
 
 ### Rapor, iptal, bakiye, başlıklar
 
 ```go
 rep, err := client.GetReport(ctx, res.OrderID, 1, 1000) // page, rowCount (0 = API varsayılanı; en çok 1000)
 fmt.Println(rep.Status, rep.Counts())                   // 113 gönderiliyor / 114 tamamlandı / 115 gönderilemedi
+// rep.Total, Delivered, Undelivered, Waiting, SubmitAt, SendAt (Europe/Istanbul), Sender, Price
 
 err = client.Cancel(ctx, res.OrderID)                   // yalnızca gönderimi başlamamış ileri tarihli sipariş
 
@@ -107,7 +110,9 @@ orders, toplam, _ := client.Summaries(ctx, start, end, 1) // sipariş başına t
 ```
 
 Rapordaki durumlar: mesaj `110` gönderiliyor, `111` gönderildi, `112` gönderilemedi (`MessageSending/MessageSent/MessageFailed`).
-`Report.Counts()` yalnızca o sayfadaki mesajları sayar; 1000'den fazla alıcılı siparişte sayfaları dolaşın veya `Summaries` kullanın.
+Yanıtta sunucu sayaçları (`total`, `delivered`, `undelivered`, `waiting`) varsa `Report.Counts()` onları (tüm sipariş) tercih eder; yoksa yalnızca o sayfadaki mesajları sayar. Rapordaki numaralar `+90…` biçiminde gelebilir; `ReportMessage.NormalizedNumber()` ile `5xxxxxxxxx`'e çevirip gönderdiğiniz numaralarla eşleştirin.
+
+`Summaries` için tarih aralığı en çok 10 gün olabilir (aşılırsa istek atmadan `ErrInvalidDate`; sunucuda 458).
 
 ## Hata yönetimi
 
@@ -132,6 +137,7 @@ if errors.As(err, &apiErr) {
 
 | Kod | Sentinel | Anlam |
 |-----|----------|-------|
+| – | `ErrHTTP` | API JSON zarfı yerine JSON olmayan HTTP hata yanıtı (WAF/proxy sayfası vb.); `APIError.Code == 0`, `HTTPStatus` dolu. 401/404 sentinel'lerine eşlenmez |
 | 400 | `ErrBadRequest` | İstek çözümlenemedi |
 | 401 | `ErrUnauthorized` | Üyelik bilgileri hatalı **veya sabit IP tanımlıysa farklı IP'den istek** |
 | 402 | `ErrInsufficientBalance` | Bakiye yetersiz |
@@ -167,12 +173,30 @@ im.MaskNumber("5312345678")          // "531*****78"
 im.EstimateParts("Merhaba şehir")    // SMS parça sayısı TAHMİNİ
 ```
 
-**`EstimateParts` bir tahmindir.** Metin tamamen GSM-7 karakterlerinden oluşuyorsa 160 (çok parçada 153) septet, aksi halde (ş, ğ, ı, İ, ç, emoji…) UCS-2 varsayılarak 70 (çok parçada 67) karakter üzerinden hesaplanır. Operatör/sağlayıcı tarafındaki gerçek kodlama (ör. Türkçe kaydırma tablosu) farklı olabilir. `Send`, tahmini 7 parçayı aşan metni istek atmadan `ErrMessageTooLong` ile reddeder; sağlayıcınızın kuralı farklıysa `Config.SkipLengthCheck` ile kapatın.
+**`EstimateParts` bir tahmindir.** Sağlayıcı tablosuna göre hesaplanır (karakter sayısı; tek parça / çok parçada parça başına):
+
+| Metin | Tek | Çok parça |
+|-------|-----|-----------|
+| GSM karakter kümesi | 155 | 153 |
+| GSM dışı Türkçe karakter içeren (ş, ğ, ı, İ, Ş, Ğ, ç) | 150 | 148 |
+| Diğer Unicode (emoji vb.) | 65 | 63 |
+
+Genişletme karakterleri (`^ { } \ [ ~ ] | €`) 2 birim sayılır. Paneldeki **"Evrensel Dil Desteği"** ayarı gerçek kodlamayı etkileyebilir; sonuç kesin değildir. `Send`, tahmini 7 parçayı aşan metni istek atmadan `ErrMessageTooLong` ile reddeder; sağlayıcınızın kuralı farklıysa `Config.SkipLengthCheck` ile kapatın.
+
+## Entegrasyon notları
+
+- **451 (tekrar eden sipariş):** Aynı başlık + aynı alıcı + aynı metin kısa sürede tekrar gönderilirse reddedilir. Aynı alıcıya art arda benzer mesajlar (ör. sipariş bildirimleri) gönderiyorsanız metne benzersiz bilgi (sipariş no, saat, kod) koyun.
+- **Hız ve boyut sınırları:** Hesap başına yaklaşık 100 SMS/sn; istek başına en çok 50.000 alıcı. Kütüphane alıcı listesini **parçalamaz**, büyük listeleri kendiniz bölün.
+- **Panel ayarları:** Panelde "API kullanımına izin ver" açık olmalıdır; sabit IP kısıtı tanımlıysa farklı IP'den gelen istek `401` döner.
+- **Sandbox yok:** Test ortamı bulunmaz; `APITEST` gibi başlıklar yalnızca dokümandaki örneklerdir, gerçek hesapta onaylı başlığınızı kullanın. Canlı testlerde gerçek SMS ve bakiye harcanır.
+- **İYS:** İşlemsel (transactional) SMS'lerde `iys "0"` (`IYSOff`, varsayılan); ticari ileti ise yasal olarak `IYSOn` olmalıdır.
+- **Yönlendirme:** Varsayılan HTTP istemcisi yönlendirmeleri takip etmez; 3xx yanıtı hata sayılır (gönderimde `ErrUncertain`).
 
 ## Güvenlik notları
 
 - Kütüphane **hiçbir zaman** tam telefon numarası, SMS metni, key veya hash loglamaz. `Logger` yalnızca uç nokta adı, süre, HTTP durum kodu, API durum kodu ve sipariş id'sini alır. Kendi loglarınızda numaraları `MaskNumber` ile maskeleyin.
-- `Config` yazdırıldığında (`%v`, `%+v`, `%#v`) anahtarlar gizlenir.
+- `Config` ve `*Client` yazdırıldığında (`%v`, `%+v`, `%#v`) ve `slog` ile loglandığında anahtarlar gizlenir.
+- `send-sms` isteğinde HTTP/2 transport'unun gövdeyi kendiliğinden yeniden göndermesi engellenir (SMS idempotent değildir); böyle durumlar `ErrUncertain` olarak size döner.
 - API anahtarlarını kaynak koda veya repoya koymayın; ortam değişkeni/secret yöneticisi kullanın. Panelde sabit IP tanımlarsanız yalnızca o IP'den istek kabul edilir (aksi halde `401`).
 - Hata değerleri istek gövdesini (kimlik bilgisi, numara) içermez.
 
@@ -193,4 +217,8 @@ ILETI_MERKEZI_KEY=... ILETI_MERKEZI_HASH=... go test -tags integration -run 'Bal
 
 - API'de alıcı alanı `receipents` (yanlış yazım) olarak geçer; kütüphane bunu kendisi yönetir.
 - JSON yanıtlarında kodlar string veya sayı olarak gelebilir; kütüphane ikisini de kabul eder.
-- Planlı gönderimde `sendDateTime` dokümandaki gibi dizi olarak (`["GG/AA/YYYY SS:DD"]`) gönderilir; anlık gönderimde boş dizidir.
+- `sendDateTime`: anlık gönderimde boş dizi, planlı gönderimde tek string (canlıda doğrulanmadı).
+
+## Lisans
+
+MIT, bkz. [LICENSE](LICENSE).
