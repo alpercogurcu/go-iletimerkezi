@@ -463,19 +463,19 @@ func TestLoggerNeverLeaksSensitiveData(t *testing.T) {
 }
 
 // Gerçek (canlı) get-report yanıtı; numara sahte.
-const liveReport = `{"response":{"status":{"code":200,"message":"İşlem başarılı"},"order":{"id":"331760636","status":114,"total":1,"delivered":1,"undelivered":0,"waiting":0,"submitAt":"2026-10-27 12:38:31","sendAt":"2026-10-27 12:38:31","sender":"TESTBASLIK","price":1,"message":[{"number":"+905312345678","status":111}]}}}`
+const liveReport = `{"response":{"status":{"code":200,"message":"İşlem başarılı"},"order":{"id":"100200300","status":114,"total":1,"delivered":1,"undelivered":0,"waiting":0,"submitAt":"2026-01-15 09:30:00","sendAt":"2026-01-15 09:30:00","sender":"TESTBASLIK","price":1,"message":[{"number":"+905312345678","status":111}]}}}`
 
 func TestGetReportLiveShape(t *testing.T) {
 	c, _ := newTest(t, reply(200, liveReport))
-	rep, err := c.GetReport(context.Background(), "331760636", 0, 0)
+	rep, err := c.GetReport(context.Background(), "100200300", 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.OrderID != "331760636" || rep.Status != OrderDone || !rep.HasTotals || rep.Total != 1 || rep.Delivered != 1 ||
+	if rep.OrderID != "100200300" || rep.Status != OrderDone || !rep.HasTotals || rep.Total != 1 || rep.Delivered != 1 ||
 		rep.Undelivered != 0 || rep.Waiting != 0 || rep.Sender != "TESTBASLIK" || rep.Price != 1 {
 		t.Fatalf("rep: %+v", rep)
 	}
-	want := time.Date(2026, 10, 27, 12, 38, 31, 0, istanbul)
+	want := time.Date(2026, 1, 15, 9, 30, 0, 0, istanbul)
 	if !rep.SubmitAt.Equal(want) || !rep.SendAt.Equal(want) {
 		t.Fatalf("zamanlar: %v %v", rep.SubmitAt, rep.SendAt)
 	}
@@ -532,7 +532,7 @@ func TestNonJSONHTTPErrorBody(t *testing.T) {
 	}
 }
 
-func TestRedirectNotFollowedAndUncertain(t *testing.T) {
+func TestRedirectNotFollowedAndErrHTTP(t *testing.T) {
 	followed := false
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { followed = true }))
 	defer target.Close()
@@ -540,27 +540,12 @@ func TestRedirectNotFollowedAndUncertain(t *testing.T) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	})
 	_, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}})
-	if !errors.Is(err, ErrUncertain) {
+	var ae *APIError
+	if !errors.Is(err, ErrHTTP) || errors.Is(err, ErrUncertain) || !errors.As(err, &ae) || ae.HTTPStatus != http.StatusTemporaryRedirect {
 		t.Fatalf("err=%v", err)
 	}
 	if followed {
 		t.Fatal("yönlendirme takip edilmemeli")
-	}
-}
-
-func TestSendDoesNotReplayBody(t *testing.T) {
-	// GetBody nil olmalı: transport gövdeyi kendiliğinden yeniden gönderemez.
-	c, _ := newTest(t, reply(200, okSend("1")))
-	var seenGetBody = true
-	c.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		seenGetBody = r.GetBody != nil
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(okSend("1"))), Header: http.Header{}}, nil
-	})
-	if _, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}}); err != nil {
-		t.Fatal(err)
-	}
-	if seenGetBody {
-		t.Fatal("send-sms isteğinde GetBody nil olmalı")
 	}
 }
 
@@ -580,5 +565,27 @@ func TestTransportErrorAfterConnIsUncertain(t *testing.T) {
 	_, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}})
 	if !errors.Is(err, ErrUncertain) || errors.Is(err, ErrNotSent) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestIdleConnClosedBeforeWriteIsNotSent(t *testing.T) {
+	mk := func(wrote bool) *Client {
+		c, _ := newTest(t, func(w http.ResponseWriter, r *http.Request) {})
+		c.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			tr := httptrace.ContextClientTrace(r.Context())
+			tr.GotConn(httptrace.GotConnInfo{Reused: true})
+			if wrote {
+				tr.WroteRequest(httptrace.WroteRequestInfo{})
+			}
+			return nil, errors.New("http: server closed idle connection")
+		})
+		return c
+	}
+	req := SendRequest{Text: "x", Recipients: []string{"5311111111"}}
+	if _, err := mk(false).Send(context.Background(), req); !errors.Is(err, ErrNotSent) || errors.Is(err, ErrUncertain) {
+		t.Fatalf("istek yazılmadıysa ErrNotSent beklenir: %v", err)
+	}
+	if _, err := mk(true).Send(context.Background(), req); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("istek yazıldıysa ErrUncertain beklenir: %v", err)
 	}
 }
