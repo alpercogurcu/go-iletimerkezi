@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"testing"
 	"time"
@@ -119,8 +121,8 @@ func TestSendMultipleMessagesAndScheduleAndIYS(t *testing.T) {
 	if order["sender"] != "BASKA" || order["iys"] != "1" || order["iysList"] != "TACIR" {
 		t.Fatalf("order: %v", order)
 	}
-	if sd := order["sendDateTime"].([]any); len(sd) != 1 || sd[0] != "05/03/2026 09:30" {
-		t.Fatalf("sendDateTime: %v", sd)
+	if sd, ok := order["sendDateTime"].(string); !ok || sd != "05/03/2026 09:30" {
+		t.Fatalf("sendDateTime tek string olmalı: %#v", order["sendDateTime"])
 	}
 	if arr, ok := order["message"].([]any); !ok || len(arr) != 2 {
 		t.Fatalf("message dizi olmalı: %v", order["message"])
@@ -394,6 +396,27 @@ func TestSummaries(t *testing.T) {
 	if f["start"] != "2026-01-02" || f["end"] != "2026-01-03" || f["page"] != float64(1) {
 		t.Fatalf("filter=%v", f)
 	}
+	if got["request"].(map[string]any)["page"] != float64(1) {
+		t.Fatalf("page istek kökünde de olmalı: %v", got["request"])
+	}
+}
+
+func TestSummariesRangeLimit(t *testing.T) {
+	hits := 0
+	c, _ := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		reply(200, `{"response":{"status":{"code":200},"count":0,"orders":[]}}`)(w, r)
+	})
+	s := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	if _, _, err := c.Summaries(context.Background(), s, s.AddDate(0, 0, 11), 1); !errors.Is(err, ErrInvalidDate) {
+		t.Fatalf("11 gün reddedilmeli: %v", err)
+	}
+	if hits != 0 {
+		t.Fatal("yerel doğrulama ağa çıktı")
+	}
+	if _, _, err := c.Summaries(context.Background(), s, s.AddDate(0, 0, 10), 1); err != nil {
+		t.Fatalf("10 gün kabul edilmeli: %v", err)
+	}
 }
 
 type captureHandler struct{ lines []string }
@@ -421,7 +444,141 @@ func TestLoggerNeverLeaksSensitiveData(t *testing.T) {
 			t.Fatalf("log %q içeriyor:\n%s", bad, all)
 		}
 	}
+	// Client / Config yazdırma ve slog ile loglama
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%v|%+v|%#v|%s|", c, c, c, c)
+	fmt.Fprintf(&sb, "%v|%+v|%#v|", *c, *c, *c)
+	fmt.Fprintf(&sb, "%v|%+v|%#v|", c.cfg, &c.cfg, c.cfg)
+	hh := &captureHandler{}
+	slog.New(hh).Info("istemci", "client", c, "clientValue", *c)
+	sb.WriteString(strings.Join(hh.lines, "\n"))
+	for _, bad := range []string{"test-key", "test-hash"} {
+		if strings.Contains(sb.String(), bad) {
+			t.Fatalf("Client/Config çıktısı %q içeriyor:\n%s", bad, sb.String())
+		}
+	}
 	if !strings.Contains(all, "order_id=99") {
 		t.Fatalf("order_id loglanmalı:\n%s", all)
+	}
+}
+
+// Gerçek (canlı) get-report yanıtı; numara sahte.
+const liveReport = `{"response":{"status":{"code":200,"message":"İşlem başarılı"},"order":{"id":"331760636","status":114,"total":1,"delivered":1,"undelivered":0,"waiting":0,"submitAt":"2026-10-27 12:38:31","sendAt":"2026-10-27 12:38:31","sender":"TESTBASLIK","price":1,"message":[{"number":"+905312345678","status":111}]}}}`
+
+func TestGetReportLiveShape(t *testing.T) {
+	c, _ := newTest(t, reply(200, liveReport))
+	rep, err := c.GetReport(context.Background(), "331760636", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OrderID != "331760636" || rep.Status != OrderDone || !rep.HasTotals || rep.Total != 1 || rep.Delivered != 1 ||
+		rep.Undelivered != 0 || rep.Waiting != 0 || rep.Sender != "TESTBASLIK" || rep.Price != 1 {
+		t.Fatalf("rep: %+v", rep)
+	}
+	want := time.Date(2026, 10, 27, 12, 38, 31, 0, istanbul)
+	if !rep.SubmitAt.Equal(want) || !rep.SendAt.Equal(want) {
+		t.Fatalf("zamanlar: %v %v", rep.SubmitAt, rep.SendAt)
+	}
+	if cn := rep.Counts(); cn != (ReportCounts{Total: 1, Sent: 1}) {
+		t.Fatalf("counts: %+v", cn)
+	}
+	n, err := rep.Messages[0].NormalizedNumber()
+	if err != nil || n != "5312345678" {
+		t.Fatalf("normalize: %q %v", n, err)
+	}
+	// Gönderdiğimiz numarayla eşleşir.
+	sent, _ := NormalizeTR("0531 234 56 78")
+	if n != sent {
+		t.Fatal("rapordaki numara gönderilen numarayla eşleşmeli")
+	}
+}
+
+func TestCountsPrefersServerTotals(t *testing.T) {
+	r := &Report{HasTotals: true, Total: 100, Delivered: 90, Undelivered: 4, Waiting: 6,
+		Messages: []ReportMessage{{Status: MessageSent}}} // yalnızca sayfa
+	if cn := r.Counts(); cn != (ReportCounts{Total: 100, Sent: 90, Failed: 4, Pending: 6}) {
+		t.Fatalf("counts: %+v", cn)
+	}
+}
+
+func TestGetReportOrderNull(t *testing.T) {
+	for _, body := range []string{
+		`{"response":{"status":{"code":200,"message":"ok"},"order":null}}`,
+		`{"response":{"status":{"code":200,"message":"ok"}}}`,
+	} {
+		c, _ := newTest(t, reply(200, body))
+		if _, err := c.GetReport(context.Background(), "1", 0, 0); !errors.Is(err, ErrUnexpectedResponse) {
+			t.Fatalf("err=%v", err)
+		}
+	}
+}
+
+func TestNonJSONHTTPErrorBody(t *testing.T) {
+	for _, code := range []int{401, 404, 403, 429} {
+		c, _ := newTest(t, reply(code, `<html>WAF engeli</html>`))
+		_, err := c.Balance(context.Background())
+		var ae *APIError
+		if !errors.As(err, &ae) || ae.Code != 0 || ae.HTTPStatus != code || !errors.Is(err, ErrHTTP) {
+			t.Fatalf("%d: err=%v", code, err)
+		}
+		if errors.Is(err, ErrUnauthorized) || errors.Is(err, ErrMethodNotFound) || errors.Is(err, ErrUncertain) {
+			t.Fatalf("%d: yanlış sentinel eşleşmesi: %v", code, err)
+		}
+	}
+	// 5xx HTML gövde: send için belirsiz kalır
+	c, _ := newTest(t, reply(502, `<html>Bad Gateway</html>`))
+	if _, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}}); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestRedirectNotFollowedAndUncertain(t *testing.T) {
+	followed := false
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { followed = true }))
+	defer target.Close()
+	c, _ := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	})
+	_, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}})
+	if !errors.Is(err, ErrUncertain) {
+		t.Fatalf("err=%v", err)
+	}
+	if followed {
+		t.Fatal("yönlendirme takip edilmemeli")
+	}
+}
+
+func TestSendDoesNotReplayBody(t *testing.T) {
+	// GetBody nil olmalı: transport gövdeyi kendiliğinden yeniden gönderemez.
+	c, _ := newTest(t, reply(200, okSend("1")))
+	var seenGetBody = true
+	c.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		seenGetBody = r.GetBody != nil
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(okSend("1"))), Header: http.Header{}}, nil
+	})
+	if _, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}}); err != nil {
+		t.Fatal(err)
+	}
+	if seenGetBody {
+		t.Fatal("send-sms isteğinde GetBody nil olmalı")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestTransportErrorAfterConnIsUncertain(t *testing.T) {
+	// GotConn tetiklenir ama yazma raporu gelmezse (veya hata olursa) belirsiz sayılır.
+	c, _ := newTest(t, func(w http.ResponseWriter, r *http.Request) {})
+	c.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if tr := httptrace.ContextClientTrace(r.Context()); tr != nil && tr.GotConn != nil {
+			tr.GotConn(httptrace.GotConnInfo{})
+		}
+		return nil, errors.New("yazma sırasında kopma")
+	})
+	_, err := c.Send(context.Background(), SendRequest{Text: "x", Recipients: []string{"5311111111"}})
+	if !errors.Is(err, ErrUncertain) || errors.Is(err, ErrNotSent) {
+		t.Fatalf("err=%v", err)
 	}
 }
