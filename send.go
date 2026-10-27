@@ -143,9 +143,11 @@ func (c *Client) Send(ctx context.Context, r SendRequest) (*SendResult, error) {
 		return nil, fmt.Errorf("%w: geçersiz IYS değeri", ErrIYSConfig)
 	}
 
-	sendAt := []string{}
+	// Anlık gönderimde boş dizi (canlıda doğrulandı); planlı gönderimde tek string
+	// "GG/AA/YYYY SS:DD" (resmi SDK ve dokümana göre).
+	var sendAt any = []string{}
 	if r.SendAt != nil {
-		sendAt = append(sendAt, FormatSendTime(*r.SendAt))
+		sendAt = FormatSendTime(*r.SendAt)
 	}
 
 	var message any = wire
