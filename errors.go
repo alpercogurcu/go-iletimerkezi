@@ -36,6 +36,12 @@ var (
 	ErrIYSConfig          = errors.New("iletimerkezi: İYS ayarları eksik veya hatalı (468/469/470)")
 	ErrServiceUnavailable = errors.New("iletimerkezi: servis geçici olarak kapalı (503)")
 
+	// ErrHTTP, API JSON zarfı yerine JSON olmayan bir HTTP hata yanıtı (WAF/proxy HTML sayfası vb.)
+	// geldiğinde döner; *APIError.HTTPStatus dolu, Code 0 olur.
+	ErrHTTP = errors.New("iletimerkezi: JSON olmayan HTTP hata yanıtı")
+	// ErrUnexpectedResponse, başarılı (200) yanıtın beklenen alanları içermemesidir.
+	ErrUnexpectedResponse = errors.New("iletimerkezi: beklenmeyen yanıt biçimi")
+
 	// ErrInvalidRequest, istek gönderilmeden önce yerel doğrulamada yakalanan hatalardır.
 	ErrInvalidRequest = errors.New("iletimerkezi: geçersiz istek")
 )
@@ -77,6 +83,9 @@ type APIError struct {
 
 // Error error arayüzünü sağlar.
 func (e *APIError) Error() string {
+	if e.Code == 0 {
+		return fmt.Sprintf("iletimerkezi HTTP hatası [%d]", e.HTTPStatus)
+	}
 	if e.Message != "" {
 		return fmt.Sprintf("iletimerkezi hatası [%d]: %s", e.Code, e.Message)
 	}
@@ -85,6 +94,9 @@ func (e *APIError) Error() string {
 
 // Is, errors.Is ile sentinel eşleşmesini sağlar.
 func (e *APIError) Is(target error) bool {
+	if e.Code == 0 && target == ErrHTTP {
+		return true
+	}
 	for _, s := range codeSentinels[e.Code] {
 		if s == target {
 			return true

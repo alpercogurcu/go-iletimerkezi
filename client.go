@@ -12,6 +12,7 @@ import (
 	"net/http/httptrace"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,13 +40,30 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	hc := cfg.HTTPClient
 	if hc == nil {
-		hc = &http.Client{Timeout: cfg.Timeout}
+		hc = &http.Client{
+			Timeout: cfg.Timeout,
+			// Yönlendirmeler takip edilmez; 3xx yanıtı olduğu gibi döner ve hata sayılır.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
 	}
 	lg := cfg.Logger
 	if lg == nil {
 		lg = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Client{cfg: cfg, http: hc, logger: lg, base: cfg.BaseURL}, nil
+}
+
+// String, kimlik bilgilerini gizleyerek istemciyi yazdırır (%v, %+v).
+func (c Client) String() string {
+	return fmt.Sprintf("iletimerkezi.Client{BaseURL:%q Sender:%q APIKey:[gizli] APIHash:[gizli]}", c.base, c.cfg.Sender)
+}
+
+// GoString, %#v için String ile aynı gizli çıktıyı verir.
+func (c Client) GoString() string { return c.String() }
+
+// LogValue, slog ile loglandığında kimlik bilgilerini gizler.
+func (c Client) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("base_url", c.base), slog.String("sender", c.cfg.Sender))
 }
 
 // flexString, JSON'da string, sayı veya null olarak gelebilen değerleri string okur.
@@ -122,14 +140,22 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNotSent, err)
 	}
+	if endpoint == "send-sms" {
+		// GetBody'yi kaldırıyoruz: aksi halde HTTP/2 transport'u GOAWAY / REFUSED_STREAM gibi
+		// durumlarda gövdeyi kendiliğinden yeniden gönderebilir. SMS gönderimi idempotent
+		// değildir; böyle bir durumda hata ErrUncertain olarak çağırana dönmelidir.
+		hreq.GetBody = nil
+	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("Accept", "application/json")
 
-	written := false
+	// Gönderim izleme: bağlantı kuruldu mu, istek tamamen yazıldı mı?
+	var gotConn, written atomic.Bool
 	hreq = hreq.WithContext(httptrace.WithClientTrace(hreq.Context(), &httptrace.ClientTrace{
+		GotConn: func(httptrace.GotConnInfo) { gotConn.Store(true) },
 		WroteRequest: func(i httptrace.WroteRequestInfo) {
 			if i.Err == nil {
-				written = true
+				written.Store(true)
 			}
 		},
 	}))
@@ -137,8 +163,10 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 	start := time.Now()
 	resp, err := c.http.Do(hreq)
 	if err != nil {
-		c.logger.Warn("iletimerkezi istek hatası", "endpoint", endpoint, "duration", time.Since(start), "sent", written)
-		if !written {
+		c.logger.Warn("iletimerkezi istek hatası", "endpoint", endpoint, "duration", time.Since(start), "conn", gotConn.Load(), "sent", written.Load())
+		// Bağlantı hiç kurulamadıysa (DNS, bağlantı reddi, önceden iptal) istek kesinlikle gitmedi.
+		// Bağlantı kurulduysa istek yazılmış ya da kısmen yazılmış olabilir: belirsiz.
+		if !gotConn.Load() {
 			return nil, fmt.Errorf("%w: %w", ErrNotSent, scrub(err))
 		}
 		return nil, fmt.Errorf("%w: %w", ErrUncertain, scrub(err))
@@ -154,10 +182,12 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 	var env envelope
 	if jerr := json.Unmarshal(raw, &env); jerr != nil || env.Response == nil {
 		c.logger.Warn("iletimerkezi çözümlenemeyen yanıt", "endpoint", endpoint, "duration", dur, "http_status", resp.StatusCode)
+		// 2xx/3xx/5xx ve çözümlenemeyen gövde: istek işlenmiş olabilir (3xx'te de emin olunamaz).
 		if resp.StatusCode >= 500 || resp.StatusCode < 400 {
 			return nil, fmt.Errorf("%w: HTTP %d, çözümlenemeyen yanıt", ErrUncertain, resp.StatusCode)
 		}
-		return nil, &APIError{Code: resp.StatusCode, HTTPStatus: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
+		// JSON olmayan 4xx (WAF/proxy sayfası vb.): API durum koduna eşlenmez.
+		return nil, &APIError{Code: 0, HTTPStatus: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
 	}
 
 	code, cerr := strconv.Atoi(string(env.Response.Status.Code))
