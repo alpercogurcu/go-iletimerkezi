@@ -55,19 +55,24 @@ func TestEstimateParts(t *testing.T) {
 		want int
 	}{
 		{"boş", "", 0},
-		{"gsm 160", r("a", 160), 1},
-		{"gsm 161", r("a", 161), 2},
+		{"gsm 155", r("a", 155), 1},
+		{"gsm 156", r("a", 156), 2},
 		{"gsm 306", r("a", 306), 2},
 		{"gsm 307", r("a", 307), 3},
-		{"genişletme karakteri 2 septet", r("a", 159) + "€", 2},
-		{"türkçe ü ö Ü (gsm)", "üöÜÇ", 1},
-		{"türkçe ş ucs2 70", r("ş", 70), 1},
-		{"türkçe ş ucs2 71", r("ş", 71), 2},
-		{"ucs2 134", r("ş", 134), 2},
-		{"ucs2 135", r("ş", 135), 3},
-		{"emoji 2 birim", r("😀", 36), 2}, // 72 UTF-16 birimi
-		{"7 parça gsm", r("a", 1071), 7},
-		{"8 parça gsm", r("a", 1072), 8},
+		{"genişletme karakteri 2 birim", r("a", 154) + "€", 2},
+		{"gsm içi türkçe ü ö Ü Ç", "üöÜÇ", 1},
+		{"türkçe ş 150", r("ş", 150), 1},
+		{"türkçe ş 151", r("ş", 151), 2},
+		{"türkçe 296", r("ş", 296), 2},
+		{"türkçe 297", r("ş", 297), 3},
+		{"türkçe karma gsm+ş 150", r("a", 149) + "ş", 1},
+		{"unicode emoji 65", r("😀", 32) + "a", 1}, // 65 UTF-16 birimi
+		{"unicode emoji 66", r("😀", 33), 2},       // 66 birim
+		{"unicode 126", r("😀", 63), 2},            // 126 birim
+		{"unicode 127", r("😀", 63) + "a", 3},
+		{"unicode+türkçe karışık unicode", "şğ😀", 1},
+		{"7 parça gsm", r("a", 7*153), 7},
+		{"8 parça gsm", r("a", 7*153+1), 8},
 	}
 	for _, tc := range cases {
 		if got := EstimateParts(tc.text); got != tc.want {

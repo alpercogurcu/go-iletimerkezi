@@ -5,58 +5,78 @@ import "unicode/utf16"
 // MaxParts, tek bir SMS metni için API'nin kabul ettiği en çok parça sayısıdır.
 const MaxParts = 7
 
-// gsmBasic, GSM 03.38 temel karakter kümesidir (1 septet). Türkçe'de yalnızca
-// Ç, Ü, Ö, ü, ö bu kümededir; ş, Ş, ğ, Ğ, ı, İ, ç değildir.
+// Sağlayıcı tablosu (karakter sayısı; tek parça / çok parçada parça başına):
+//
+//	GSM karakter kümesi          : 155 / 153
+//	Türkçe karakterli (ş ğ ı İ …): 150 / 148
+//	Diğer Unicode                : 65 / 63
+const (
+	gsmSingle, gsmMulti         = 155, 153
+	turkishSingle, turkishMulti = 150, 148
+	unicodeSingle, unicodeMulti = 65, 63
+)
+
+// gsmBasic, GSM 03.38 temel karakter kümesidir (1 birim).
 const gsmBasic = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà"
 
-// gsmExt, 2 septet tutan genişletme karakterleridir.
+// gsmExt, 2 birim tutan genişletme karakterleridir.
 const gsmExt = "^{}\\[~]|€\f"
 
-var gsmBasicSet, gsmExtSet = func() (map[rune]bool, map[rune]bool) {
-	b, e := map[rune]bool{}, map[rune]bool{}
+// turkishOnly, GSM kümesinde olmayan Türkçe karakterlerdir (ç, ö, ü, Ç, Ö, Ü zaten GSM'dedir).
+const turkishOnly = "şŞğĞıİç"
+
+var gsmBasicSet, gsmExtSet, turkishSet = func() (map[rune]bool, map[rune]bool, map[rune]bool) {
+	b, e, tr := map[rune]bool{}, map[rune]bool{}, map[rune]bool{}
 	for _, r := range gsmBasic {
 		b[r] = true
 	}
 	for _, r := range gsmExt {
 		e[r] = true
 	}
-	return b, e
+	for _, r := range turkishOnly {
+		tr[r] = true
+	}
+	return b, e, tr
 }()
+
+func ceilDiv(n, d int) int { return (n + d - 1) / d }
 
 // EstimateParts, metnin kaç SMS parçasına bölüneceğini TAHMİN eder.
 //
-// Tüm karakterler GSM-7 kümesindeyse tek parça 160, çok parçada parça başına 153
-// septet; aksi halde (ş, ğ, ı, İ, ç, emoji vb.) UCS-2 varsayılır: tek parça 70, çok
-// parçada parça başına 67 karakter. Sağlayıcının operatör tarafı kodlaması (örn.
-// Türkçe kaydırma tablosu) farklı olabilir; sonuç kesin değil, yaklaşık değerdir.
-// Boş metin için 0 döner.
+// Metin tamamen GSM karakterlerinden oluşuyorsa 155 (çok parçada 153), GSM dışı
+// Türkçe karakter (ş, ğ, ı, İ, Ş, Ğ, ç) içeriyorsa 150 (çok parçada 148), başka
+// Unicode karakter (emoji vb.) içeriyorsa 65 (çok parçada 63) karakter üzerinden
+// hesaplanır. Genişletme karakterleri (^ { } \ [ ~ ] | €) 2 birim sayılır.
+// Gerçek kodlama panel ayarlarına (ör. "Evrensel Dil Desteği") ve operatöre göre
+// değişebilir; sonuç kesin değil, yaklaşık değerdir. Boş metin için 0 döner.
 func EstimateParts(text string) int {
 	if text == "" {
 		return 0
 	}
-	septets, gsm := 0, true
+	units, hasTurkish := 0, false
 	for _, r := range text {
 		switch {
 		case gsmBasicSet[r]:
-			septets++
+			units++
 		case gsmExtSet[r]:
-			septets += 2
+			units += 2
+		case turkishSet[r]:
+			units++
+			hasTurkish = true
 		default:
-			gsm = false
-		}
-		if !gsm {
-			break
+			n := len(utf16.Encode([]rune(text)))
+			if n <= unicodeSingle {
+				return 1
+			}
+			return ceilDiv(n, unicodeMulti)
 		}
 	}
-	if gsm {
-		if septets <= 160 {
-			return 1
-		}
-		return (septets + 152) / 153
+	single, multi := gsmSingle, gsmMulti
+	if hasTurkish {
+		single, multi = turkishSingle, turkishMulti
 	}
-	units := len(utf16.Encode([]rune(text)))
-	if units <= 70 {
+	if units <= single {
 		return 1
 	}
-	return (units + 66) / 67
+	return ceilDiv(units, multi)
 }
