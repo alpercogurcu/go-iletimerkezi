@@ -22,8 +22,9 @@ const gsmBasic = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\
 // gsmExt, 2 birim tutan genişletme karakterleridir.
 const gsmExt = "^{}\\[~]|€\f"
 
-// turkishOnly, GSM kümesinde olmayan Türkçe karakterlerdir (ç, ö, ü, Ç, Ö, Ü zaten GSM'dedir).
-const turkishOnly = "şŞğĞıİç"
+// turkishOnly, Türkçe'ye özgü 12 harftir. Bir kısmı (Ç, ö, Ö, ü, Ü) GSM kümesinde de olsa
+// güvenli tarafta kalmak için hepsi Türkçe sınıfı (150/148) sayılır.
+const turkishOnly = "şŞğĞıİçÇöÖüÜ"
 
 var gsmBasicSet, gsmExtSet, turkishSet = func() (map[rune]bool, map[rune]bool, map[rune]bool) {
 	b, e, tr := map[rune]bool{}, map[rune]bool{}, map[rune]bool{}
@@ -43,8 +44,8 @@ func ceilDiv(n, d int) int { return (n + d - 1) / d }
 
 // EstimateParts, metnin kaç SMS parçasına bölüneceğini TAHMİN eder.
 //
-// Metin tamamen GSM karakterlerinden oluşuyorsa 155 (çok parçada 153), GSM dışı
-// Türkçe karakter (ş, ğ, ı, İ, Ş, Ğ, ç) içeriyorsa 150 (çok parçada 148), başka
+// Metin tamamen GSM karakterlerinden oluşuyorsa 155 (çok parçada 153), Türkçe
+// karakter (ş ğ ı İ ç Ş Ğ Ç ö Ö ü Ü) içeriyorsa 150 (çok parçada 148), başka
 // Unicode karakter (emoji vb.) içeriyorsa 65 (çok parçada 63) karakter üzerinden
 // hesaplanır. Genişletme karakterleri (^ { } \ [ ~ ] | €) 2 birim sayılır.
 // Gerçek kodlama panel ayarlarına (ör. "Evrensel Dil Desteği") ve operatöre göre
@@ -56,13 +57,13 @@ func EstimateParts(text string) int {
 	units, hasTurkish := 0, false
 	for _, r := range text {
 		switch {
+		case turkishSet[r]:
+			units++
+			hasTurkish = true
 		case gsmBasicSet[r]:
 			units++
 		case gsmExtSet[r]:
 			units += 2
-		case turkishSet[r]:
-			units++
-			hasTurkish = true
 		default:
 			n := len(utf16.Encode([]rune(text)))
 			if n <= unicodeSingle {
