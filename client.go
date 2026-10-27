@@ -140,12 +140,6 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNotSent, err)
 	}
-	if endpoint == "send-sms" {
-		// GetBody'yi kaldırıyoruz: aksi halde HTTP/2 transport'u GOAWAY / REFUSED_STREAM gibi
-		// durumlarda gövdeyi kendiliğinden yeniden gönderebilir. SMS gönderimi idempotent
-		// değildir; böyle bir durumda hata ErrUncertain olarak çağırana dönmelidir.
-		hreq.GetBody = nil
-	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("Accept", "application/json")
 
@@ -166,7 +160,7 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 		c.logger.Warn("iletimerkezi istek hatası", "endpoint", endpoint, "duration", time.Since(start), "conn", gotConn.Load(), "sent", written.Load())
 		// Bağlantı hiç kurulamadıysa (DNS, bağlantı reddi, önceden iptal) istek kesinlikle gitmedi.
 		// Bağlantı kurulduysa istek yazılmış ya da kısmen yazılmış olabilir: belirsiz.
-		if !gotConn.Load() {
+		if !gotConn.Load() || (!written.Load() && isIdleConnClosed(err)) {
 			return nil, fmt.Errorf("%w: %w", ErrNotSent, scrub(err))
 		}
 		return nil, fmt.Errorf("%w: %w", ErrUncertain, scrub(err))
@@ -179,11 +173,17 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 		return nil, fmt.Errorf("%w: yanıt okunamadı: %w", ErrUncertain, scrub(rerr))
 	}
 
+	// Yönlendirme takip edilmez; 3xx istek işlenmedi demektir.
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		c.logger.Warn("iletimerkezi yönlendirme yanıtı", "endpoint", endpoint, "duration", dur, "http_status", resp.StatusCode)
+		return nil, &APIError{Code: 0, HTTPStatus: resp.StatusCode, Message: http.StatusText(resp.StatusCode)}
+	}
+
 	var env envelope
 	if jerr := json.Unmarshal(raw, &env); jerr != nil || env.Response == nil {
 		c.logger.Warn("iletimerkezi çözümlenemeyen yanıt", "endpoint", endpoint, "duration", dur, "http_status", resp.StatusCode)
-		// 2xx/3xx/5xx ve çözümlenemeyen gövde: istek işlenmiş olabilir (3xx'te de emin olunamaz).
-		if resp.StatusCode >= 500 || resp.StatusCode < 400 {
+		// 2xx/5xx ve çözümlenemeyen gövde: istek işlenmiş olabilir (3xx'te de emin olunamaz).
+		if resp.StatusCode >= 500 || resp.StatusCode < 300 {
 			return nil, fmt.Errorf("%w: HTTP %d, çözümlenemeyen yanıt", ErrUncertain, resp.StatusCode)
 		}
 		// JSON olmayan 4xx (WAF/proxy sayfası vb.): API durum koduna eşlenmez.
@@ -200,6 +200,16 @@ func (c *Client) call(ctx context.Context, endpoint string, req any) (*envelope,
 		return nil, &APIError{Code: code, Message: env.Response.Status.Message, HTTPStatus: resp.StatusCode}
 	}
 	return &env, nil
+}
+
+// isIdleConnClosed, yeniden kullanılan (keep-alive) bir bağlantının sunucu tarafından, istek
+// tamamen yazılmadan kapatıldığı durumu tanır. net/http bu hatayı dışa açmaz
+// (errServerClosedIdle), bu yüzden hata metnine bakmak zorundayız; kırılgan bir eşleşmedir.
+// Yalnızca WroteRequest başarı raporu GELMEMİŞSE kullanılır: istek tamamen yazılmadıysa
+// sunucu eksik gövdeyi işleyemez, dolayısıyla SMS gitmemiştir. Metin değişirse davranış
+// kendiliğinden muhafazakâr olana (ErrUncertain) düşer.
+func isIdleConnClosed(err error) bool {
+	return strings.Contains(err.Error(), "server closed idle connection")
 }
 
 // scrub, url.Error içindeki URL'yi atıp yalnızca altta yatan hatayı döndürür.
